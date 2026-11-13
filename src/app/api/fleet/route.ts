@@ -1,0 +1,417 @@
+import { NextRequest, NextResponse } from "next/server";
+import {
+  FLEET,
+  GITHUB_OWNER,
+  GITHUB_TOKEN,
+  INDEXNOW_KEY,
+  auditScore,
+  type FleetResponse,
+  type RepoInfo,
+  type SiteAudit,
+  type SiteHealth,
+} from "@/lib/fleet";
+import { readLog, totalSubmitted } from "@/lib/activity-log";
+import { autoSubmitArmed } from "@/lib/auto-submit";
+import { runDeployWatch } from "@/lib/deploy-watch";
+import { runAutoHeal } from "@/lib/autopilot";
+import { getAdminAuth, requireAdmin } from "@/lib/security";
+import { recordUptime, readUptime, readUptimeRollups, uptimeStats } from "@/lib/uptime";
+import { buildPrevStates, updateIncidents } from "@/lib/incidents";
+import { recordScoreAvg, readScoreRollups } from "@/lib/score-history";
+import { readStateMeta } from "@/lib/pg-state";
+import type { VerifyStatus } from "@/lib/fleet";
+
+export const dynamic = "force-dynamic";
+// serverless safety: fleet checks + upstream API calls can take a while
+export const maxDuration = 60;
+
+const CACHE_TTL_MS = 30_000;
+const REPOS_TTL_MS = 5 * 60_000;
+const VERIFY_TTL_MS = 5 * 60_000;
+
+let cache: { at: number; payload: FleetResponse } | null = null;
+let reposCache: { at: number; data: Record<string, RepoInfo> } | null = null;
+let verifyCache: { at: number; gsc: VerifyStatus; bing: VerifyStatus } | null = null;
+
+async function fetchText(url: string, timeoutMs = 8000) {
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { "user-agent": "FleetControl/1.0 (+abdelhadygabriel.me)" },
+    cache: "no-store",
+    redirect: "follow",
+  });
+  const text = res.ok ? await res.text() : "";
+  return { status: res.status, text };
+}
+
+// Extract the content attribute of a <meta> tag matched by name= or property=
+// (works with attributes in any order since [^>]* spans the whole open tag)
+function metaContent(html: string, attr: "name" | "property", key: string): string | null {
+  const tag = html.match(new RegExp(`<meta[^>]*${attr}=["']${key}["'][^>]*>`, "i"))?.[0];
+  if (!tag) return null;
+  return tag.match(/content=["']([^"']*)["']/i)?.[1] ?? null;
+}
+
+function tagPresent(html: string, pattern: string): boolean {
+  return new RegExp(pattern, "i").test(html);
+}
+
+function parseAudit(html: string): SiteAudit {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? null;
+  const description = metaContent(html, "name", "description");
+  const lang = html.match(/<html[^>]*\slang=["']([^"']*)["']/i)?.[1]?.trim() ?? null;
+  const titleLength = title?.length ?? 0;
+  const descriptionLength = description?.trim().length ?? 0;
+  const ogTitleOk = tagPresent(html, `<meta[^>]*property=["']og:title["']`);
+  const ogImageOk = tagPresent(html, `<meta[^>]*property=["']og:image["']`);
+  return {
+    title,
+    titleLength,
+    titleOk: !!title && titleLength >= 15 && titleLength <= 60,
+    description: description?.trim() || null,
+    descriptionLength,
+    descriptionOk: !!description && descriptionLength >= 50 && descriptionLength <= 160,
+    canonicalOk:
+      /<link[^>]+rel=["']canonical["'][^>]*>/i.test(html) ||
+      /<link[^>]+href=["'][^"']+["'][^>]*rel=["']canonical["']/i.test(html),
+    ogTitleOk,
+    ogImageOk,
+    twitterOk: tagPresent(html, `<meta[^>]*name=["']twitter:card["']`),
+    viewportOk: tagPresent(html, `<meta[^>]*name=["']viewport["']`),
+    faviconOk:
+      tagPresent(html, `<link[^>]+rel=["'][^"']*icon[^"']*["']`) ||
+      /<link[^>]+href=["'][^"']*favicon[^"']*["']/i.test(html),
+    lang,
+    langOk: !!lang,
+    h1Count: (html.match(/<h1[\s>]/gi) ?? []).length,
+    ogTitleText: metaContent(html, "property", "og:title"),
+    ogDescText: metaContent(html, "property", "og:description"),
+    ogImageUrl: metaContent(html, "property", "og:image")?.trim() ?? null,
+    seoScore: 0, // filled by auditScore() after health checks
+  };
+}
+
+async function checkHost(host: string): Promise<SiteHealth> {
+  const base = `https://${host}`;
+  const health: SiteHealth = {
+    httpStatus: null,
+    title: null,
+    robotsOk: false,
+    robotsHasSitemap: false,
+    sitemapOk: false,
+    sitemapUrls: 0,
+    keyOk: false,
+    canonicalOk: false,
+    ogOk: false,
+    audit: null,
+  };
+  try {
+    const [home, robots, sitemap, key] = await Promise.all([
+      fetchText(`${base}/`),
+      fetchText(`${base}/robots.txt`),
+      fetchText(`${base}/sitemap.xml`),
+      fetchText(`${base}/${INDEXNOW_KEY}.txt`),
+    ]);
+    health.httpStatus = home.status;
+    health.title = home.text.match(/<title[^>]*>([^<]*)/i)?.[1]?.trim() ?? null;
+    health.robotsOk = robots.status === 200;
+    health.robotsHasSitemap = /sitemap:\s*\S+/i.test(robots.text);
+    health.sitemapOk = sitemap.status === 200 && sitemap.text.includes("<urlset");
+    health.sitemapUrls = (sitemap.text.match(/<loc>/g) ?? []).length;
+    health.keyOk = key.status === 200 && key.text.trim() === INDEXNOW_KEY;
+    const audit = home.text ? parseAudit(home.text) : null;
+    if (audit?.ogImageUrl && !/^https?:\/\//i.test(audit.ogImageUrl)) {
+      try {
+        audit.ogImageUrl = new URL(audit.ogImageUrl, base).toString();
+      } catch {
+        /* keep raw relative URL */
+      }
+    }
+    health.canonicalOk = audit?.canonicalOk ?? false;
+    health.ogOk = !!(audit?.ogTitleOk || audit?.ogImageOk);
+    if (audit) audit.seoScore = auditScore({ robotsOk: health.robotsOk, sitemapOk: health.sitemapOk, keyOk: health.keyOk, audit });
+    health.audit = audit;
+  } catch (e) {
+    health.error = e instanceof Error ? e.message : "unknown error";
+  }
+  return health;
+}
+
+async function fetchRepos(): Promise<Record<string, RepoInfo>> {
+  if (reposCache && Date.now() - reposCache.at < REPOS_TTL_MS) {
+    return reposCache.data;
+  }
+  if (!GITHUB_TOKEN) return {};
+  try {
+    // M4 (2026-09-21): /user/repos with the vault token lists PRIVATE repos
+    // too — /users/{owner}/repos only ever returned public ones, so
+    // repoInfo was silently absent for private repos and isPrivate was
+    // always false. Extra repos beyond the fleet are harmless (keyed by
+    // name; only FLEET names are looked up).
+    const res = await fetch(
+      "https://api.github.com/user/repos?per_page=100&sort=pushed",
+      {
+        signal: AbortSignal.timeout(10000),
+        headers: {
+          authorization: `Bearer ${GITHUB_TOKEN}`,
+          accept: "application/vnd.github+json",
+        },
+        cache: "no-store",
+      },
+    );
+    if (!res.ok) return {};
+    const list = (await res.json()) as Array<Record<string, unknown>>;
+    const data: Record<string, RepoInfo> = {};
+    for (const r of list) {
+      data[String(r.name)] = {
+        name: String(r.name),
+        isPrivate: Boolean(r.private),
+        pushedAt: (r.pushed_at as string) ?? null,
+        language: (r.language as string) ?? null,
+        homepage: (r.homepage as string) || null,
+      };
+    }
+    reposCache = { at: Date.now(), data };
+    return data;
+  } catch {
+    return {};
+  }
+}
+
+// Google Search Console domain verification = TXT record on the apex domain.
+// Bing = conventional BingSiteAuth.xml file at the www root.
+async function checkVerification(): Promise<{ gsc: VerifyStatus; bing: VerifyStatus }> {
+  if (verifyCache && Date.now() - verifyCache.at < VERIFY_TTL_MS) {
+    return { gsc: verifyCache.gsc, bing: verifyCache.bing };
+  }
+  const gsc: VerifyStatus = { checked: false, verified: false, record: null };
+  const bing: VerifyStatus = { checked: false, verified: false, record: null };
+  const [dns, bingFile] = await Promise.allSettled([
+    fetch("https://dns.google/resolve?name=abdelhadygabriel.me&type=TXT", {
+      signal: AbortSignal.timeout(5000),
+      cache: "no-store",
+    }),
+    fetchText("https://www.abdelhadygabriel.me/BingSiteAuth.xml", 5000),
+  ]);
+  if (dns.status === "fulfilled" && dns.value.ok) {
+    try {
+      const json = (await dns.value.json()) as {
+        Answer?: Array<{ data: string }>;
+      };
+      const txt = (json.Answer ?? [])
+        .map((a) => a.data.replace(/^"|"$/g, ""))
+        .find((d) => d.startsWith("google-site-verification="));
+      gsc.checked = true;
+      gsc.verified = !!txt;
+      gsc.record = txt ?? null;
+    } catch {
+      /* DNS probe failed — report as unchecked */
+    }
+  }
+  if (bingFile.status === "fulfilled") {
+    bing.checked = true;
+    bing.verified = bingFile.value.status === 200 && /<users>/i.test(bingFile.value.text);
+    bing.record = bing.verified ? "BingSiteAuth.xml" : null;
+  }
+  verifyCache = { at: Date.now(), gsc, bing };
+  return { gsc, bing };
+}
+
+/**
+ * Response shaping (2026-09-21 audit fix). Anonymous callers keep the 24/7
+ * heartbeat alive (cache-miss checks still run the full pipeline — the
+ * autopilot design is untouched) but only ever see aggregate health: no repo
+ * names, no per-site detail, no GSC verification records, no incident hosts.
+ * Signed-in admins get the full payload. `force=1` (a full fresh check:
+ * 56+ outbound fetches, submissions, autopilot) is admin-only now.
+ */
+function fleetResponse(payload: FleetResponse, privileged: boolean, extra: Record<string, unknown> = {}) {
+  if (privileged) return NextResponse.json({ ...payload, ...extra });
+  return NextResponse.json({
+    ok: true,
+    checkedAt: payload.checkedAt,
+    ...extra,
+    summary: {
+      total: payload.summary.total,
+      live: payload.summary.live,
+      avgScore: payload.summary.avgScore,
+      uptimePct: payload.summary.uptimePct,
+    },
+  });
+}
+
+export async function GET(req: NextRequest) {
+  const force = req.nextUrl.searchParams.get("force") === "1";
+
+  // force = the expensive, side-effectful path — signed-in admins only.
+  if (force) {
+    const gate = requireAdmin(req);
+    if (gate) return gate;
+  }
+
+  const auth = getAdminAuth(req);
+  const privileged = !auth.authRequired || auth.authenticated;
+
+  if (!force && cache && Date.now() - cache.at < CACHE_TTL_MS) {
+    return fleetResponse(cache.payload, privileged, { cached: true });
+  }
+
+  const [repos] = await Promise.all([fetchRepos()]);
+
+  const sites = await Promise.all(
+    FLEET.map(async (def) => ({
+      ...def,
+      repoUrl: `https://github.com/${GITHUB_OWNER}/${def.repo}`,
+      health: await checkHost(def.host),
+      repoInfo: repos[def.repo],
+    })),
+  );
+
+  const log = await readLog();
+  const liveSites = sites.filter((s) => s.health.httpStatus === 200);
+
+  // self-driving indexing: armed hosts past their 6h cooldown get re-submitted
+  const armedHosts = sites
+    .filter(
+      (s) =>
+        s.health.httpStatus === 200 &&
+        s.health.robotsOk &&
+        s.health.sitemapOk &&
+        s.health.keyOk,
+    )
+    .map((s) => s.host);
+  const autoResults = await autoSubmitArmed(armedHosts, log);
+  const logForCount = [...autoResults, ...log];
+
+  // deploy-triggered half of self-driving indexing (90s self-throttled):
+  // new READY production deployments → IndexNow + GSC sitemap resubmit.
+  // Surfaced on /integrations via /api/resubmit (state + log).
+  await runDeployWatch().catch(() => null);
+
+  const scores = liveSites.map((s) => s.health.audit?.seoScore ?? 0);
+  const avgScore = scores.length
+    ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+    : 0;
+
+  // persist uptime samples + reconcile incidents (fresh checks only)
+  const prevStates = await buildPrevStates();
+  await recordUptime(
+    sites.map((s) => ({
+      host: s.host,
+      ok: s.health.httpStatus === 200 && !s.health.error,
+      score: s.health.audit?.seoScore ?? 0,
+    })),
+  );
+  const incidentView = await updateIncidents(
+    prevStates,
+    sites.map((s) => ({
+      host: s.host,
+      ok: s.health.httpStatus === 200 && !s.health.error,
+    })),
+  );
+  const [uptimeStore, uptimeRollups] = await Promise.all([readUptime(), readUptimeRollups()]);
+  const sitesWithUptime = sites.map((s) => ({
+    ...s,
+    uptime: uptimeStats(uptimeStore[s.host], uptimeRollups[s.host]),
+  }));
+  // H3: fleet uptime is computed over the daily rollups (up to 30 days), not
+  // the ~1h of raw samples — and the window it really covers is reported so
+  // the UI can label the number honestly.
+  const rollupLists = Object.values(uptimeRollups);
+  const rollupTotals = rollupLists.reduce(
+    (acc, list) => {
+      for (const r of list) {
+        acc.n += r.n;
+        acc.up += r.up;
+        acc.minD = acc.minD === 0 ? Date.parse(`${r.d}T00:00:00Z`) : acc.minD;
+        acc.maxD = Math.max(acc.maxD, Date.parse(`${r.d}T00:00:00Z`));
+      }
+      return acc;
+    },
+    { n: 0, up: 0, minD: 0, maxD: 0 },
+  );
+  const rawSamples = Object.values(uptimeStore).flat();
+  const fleetUptimePct = rollupTotals.n
+    ? Math.round((rollupTotals.up / rollupTotals.n) * 1000) / 10
+    : rawSamples.length
+      ? Math.round(
+          (rawSamples.filter((u) => u.ok).length / rawSamples.length) * 1000,
+        ) / 10
+      : 100;
+  const uptimeWindowDays = rollupTotals.n
+    ? Math.max(1, Math.round((rollupTotals.maxD - rollupTotals.minD) / 86_400_000) + 1)
+    : undefined;
+
+  const { gsc, bing } = await checkVerification();
+
+  // L4 state-layer health: version + freshness of the most-written state key
+  // (uptime — the heartbeat writes it on every fresh check). Admin payload
+  // only; the anonymous aggregate below never copies it.
+  const stateMeta = await readStateMeta("uptime");
+
+  // AUTO-PILOT: the fleet repairs itself — stale domain assignments get
+  // re-attached (even while up — wrong content is a defect), down sites get a
+  // guarded production redeploy (3h cooldown, never while a deploy is already
+  // building). Runs on every fresh check.
+  const autoPilot = await runAutoHeal(
+    sites.map((s) => ({
+      host: s.host,
+      repo: s.repo,
+      blocker: s.blocker,
+      ok: s.health.httpStatus === 200 && !s.health.error,
+    })),
+  );
+
+  // fleet score trend — record one avg per fresh check (guarded: never record
+  // when every host failed, that would be a sandbox/network artifact not truth)
+  if (liveSites.length > 0) await recordScoreAvg(avgScore);
+  // H3: the chart reads hourly rollups (30-day retention) instead of raw
+  // points (~6h) — last 7 days of real history, one point per hour.
+  const trend = (await readScoreRollups())
+    .slice(-168)
+    .map((r) => ({ t: r.h, avg: Math.round(r.avg * 10) / 10 }));
+
+  const payload: FleetResponse = {
+    checkedAt: new Date().toISOString(),
+    cached: false,
+    sites: sitesWithUptime,
+    summary: {
+      total: sites.length,
+      live: liveSites.length,
+      seoArmed: sites.filter(
+        (s) =>
+          s.health.httpStatus === 200 &&
+          s.health.robotsOk &&
+          s.health.sitemapOk &&
+          s.health.keyOk,
+      ).length,
+      urlsSubmitted: totalSubmitted(logForCount),
+      avgScore,
+      uptimePct: fleetUptimePct,
+      uptimeWindowDays,
+      downHosts: incidentView.active.map((i) => i.host),
+      attention: sites
+        .filter(
+          (s) =>
+            s.blocker ||
+            s.health.httpStatus !== 200 ||
+            s.health.error ||
+            !(s.health.robotsOk && s.health.sitemapOk && s.health.keyOk),
+        )
+        .map((s) => s.id),
+    },
+    gsc,
+    bing,
+    incidents: incidentView,
+    trend,
+    autoPilot,
+    stateLayer: {
+      mode: stateMeta.mode,
+      version: stateMeta.version,
+      updatedAt: stateMeta.updatedAt,
+    },
+  };
+
+  cache = { at: Date.now(), payload };
+  return fleetResponse(payload, privileged);
+}

@@ -1,0 +1,23 @@
+// Fleet Control — Prisma schema (sandbox adaptation: SQLite)
+// Upstream (v18) runs PostgreSQL/Neon with a Json-typed value column. This
+// sandbox only has the SQLite client, so the single PgState KV table keeps the
+// exact same shape but stores `value` as a JSON *string*; src/lib/pg-state.ts
+// stringifies/parses at the seam, so every other lib (security events,
+// activity, uptime, score history, incidents, IndexNow log, auto-pilot,
+// agent sessions, vault tokens) is unchanged from upstream.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model PgState {
+  key       String   @id
+  value     String // JSON document (stringified — SQLite has no Json column)
+  version   Int      @default(0) // optimistic-concurrency guard for mutateState CAS writes
+  updatedAt DateTime @updatedAt
+}

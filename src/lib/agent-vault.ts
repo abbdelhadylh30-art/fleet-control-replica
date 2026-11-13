@@ -1,0 +1,898 @@
+// ─── Agent vault — connect tokens once, mint revocable agent links ──────────
+// v22 (2026-11-05): the ACCESS MODEL is now approval-only — temp passwords
+// (fac_…) minted in the dashboard, the AI requests, the owner approves, the
+// AI works under a 1-hour derived session (fls_…). Direct agent links and
+// pair codes are retired (resolveSession rejects flk_; /exchange and /pair
+// return 410). Tokens live in the durable Postgres vault (pg-state) — add /
+// disconnect them from the dashboard at any time; the db/ files are a local-
+// dev mirror only and the env vars (FLEET_GITHUB_TOKEN / FLEET_VERCEL_TOKEN /
+// FLEET_AGENT_KEYS) act as fallbacks that a disconnect marker can suppress.
+
+import { promises as fs } from "fs";
+import path from "path";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
+
+import { deleteState, mutateState, readState, writeState } from "@/lib/pg-state";
+
+const GITHUB_AUTH_PATH = path.join(process.cwd(), "db", "github-auth.json");
+// v22: the PRIMARY token store is durable Postgres (pg-state) — the db/ file
+// mirror silently failed on serverless (read-only FS), which made the
+// dashboard's "Validate & vault it" button a no-op on deployed instances.
+const GITHUB_STATE_KEY = "vault-github-auth";
+
+const GITHUB_API = "https://api.github.com";
+const MAX_ACTIVITY = 200;
+const MAX_SESSIONS = 20;
+
+// ─── types ───────────────────────────────────────────────────────────────────
+
+export type AgentScope =
+  | "github:read"
+  | "github:write"
+  | "vercel:read"
+  | "vercel:write";
+
+export const ALL_SCOPES: AgentScope[] = [
+  "github:read",
+  "github:write",
+  "vercel:read",
+  "vercel:write",
+];
+
+export interface GithubAuthStore {
+  token: string;
+  savedAt: string; // ISO
+  account: { login: string; type: string; scopes: string | null };
+}
+
+export interface AgentSession {
+  id: string;
+  /** H5 (2026-09-21): only sha256(key) is stored — never the key itself.
+   * keyHint is a non-sensitive masked form ("flk_…abcd") kept for the
+   * dashboard list; the full key is returned EXACTLY ONCE at creation. */
+  keyHash: string; // sha256 hex (64 chars)
+  keyHint: string; // masked display form
+  /** Legacy rows (pre-H5) still carry the plaintext key here. On the first
+   * successful use they are migrated to keyHash + keyHint and this field is
+   * dropped. Read-only — new sessions never set it. */
+  key?: string;
+  label: string;
+  scopes: AgentScope[];
+  createdAt: string;
+  expiresAt: string;
+  lastUsedAt: string | null;
+  callCount: number;
+  revoked: boolean;
+}
+
+export interface AgentActivityEntry {
+  t: string; // ISO
+  label: string; // session label
+  provider: "github" | "vercel" | "-";
+  op: string; // "GET /user" etc.
+  ok: boolean;
+  status: number | string;
+}
+
+// ─── small file helpers (best-effort, non-fatal on read errors) ─────────────
+
+async function readJson<T>(p: string): Promise<T | null> {
+  try {
+    const raw = await fs.readFile(p, "utf8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJson(p: string, data: unknown): Promise<void> {
+  try {
+    await fs.writeFile(p, JSON.stringify(data), { mode: 0o600 });
+  } catch {
+    /* best-effort */
+  }
+}
+
+// ─── vault disable flags ("true disconnect", 2026-09-21) ────────────────────
+// Disconnecting used to only delete the local db/ file — on deployed
+// instances the env fallback (FLEET_GITHUB_TOKEN / FLEET_VERCEL_TOKEN) kept
+// the vault silently connected, which made the dashboard Disconnect button
+// feel broken. Now a disconnect writes a durable pg-state marker that
+// suppresses BOTH the file store and the env fallback until the user
+// reconnects. Reconnecting clears the marker.
+
+const VAULT_DISABLE_KEY = "vault-disabled";
+
+interface VaultDisableFlags {
+  github?: string; // ISO timestamp of disconnect
+  vercel?: string;
+}
+
+async function readDisableFlags(): Promise<VaultDisableFlags> {
+  return (await readState<VaultDisableFlags>(VAULT_DISABLE_KEY)) ?? {};
+}
+
+async function setDisableFlag(provider: "github" | "vercel", disabled: boolean): Promise<void> {
+  await mutateState<VaultDisableFlags>(VAULT_DISABLE_KEY, (cur) => {
+    const next: VaultDisableFlags = { ...(cur ?? {}) };
+    if (disabled) next[provider] = new Date().toISOString();
+    else delete next[provider];
+    return next;
+  });
+}
+
+export async function vaultDisableStatus(): Promise<VaultDisableFlags> {
+  return readDisableFlags();
+}
+
+// ─── GitHub token vault ──────────────────────────────────────────────────────
+
+/**
+ * Serverless fallback: on Vercel the db/ files don't persist, so a deployed
+ * instance reads the vault token from env instead (FLEET_GITHUB_TOKEN).
+ * Never used when the local file exists.
+ */
+function envGithubStore(): GithubAuthStore | null {
+  const t = process.env.FLEET_GITHUB_TOKEN;
+  if (!t || t.length < 20) return null;
+  return {
+    token: t,
+    savedAt: "",
+    account: { login: "env-configured", type: "User", scopes: null },
+  };
+}
+
+export async function readGithubAuth(): Promise<GithubAuthStore | null> {
+  // true disconnect: a durable marker suppresses pg, file AND env fallbacks
+  if ((await readDisableFlags()).github) return null;
+  // 1 · durable Postgres vault (survives cold starts — this is what makes
+  //     "add a token by will" actually work on the deployed instance)
+  const stored = await readState<GithubAuthStore>(GITHUB_STATE_KEY);
+  if (stored?.token) return stored;
+  // 2 · local file (dev convenience)  3 · env fallback
+  const store = await readJson<GithubAuthStore>(GITHUB_AUTH_PATH);
+  return store?.token ? store : envGithubStore();
+}
+
+export interface GithubStatus {
+  connected: boolean;
+  savedAt: string | null;
+  account: { login: string; type: string; scopes: string | null } | null;
+  disabledAt: string | null;
+  /** "vault" = a token the OWNER added via the dashboard; "env" = fallback. */
+  source: "vault" | "env" | null;
+}
+
+export async function githubStatus(): Promise<GithubStatus> {
+  const disabledAt = (await readDisableFlags()).github ?? null;
+  if (disabledAt) {
+    return { connected: false, savedAt: null, account: null, disabledAt, source: null };
+  }
+  const stored = await readState<GithubAuthStore>(GITHUB_STATE_KEY);
+  if (stored?.token) {
+    return {
+      connected: true,
+      savedAt: stored.savedAt || null,
+      account: stored.account,
+      disabledAt: null,
+      source: "vault",
+    };
+  }
+  const store = await readJson<GithubAuthStore>(GITHUB_AUTH_PATH);
+  if (store?.token) {
+    return {
+      connected: true,
+      savedAt: store.savedAt || null,
+      account: store.account,
+      disabledAt: null,
+      source: "vault",
+    };
+  }
+  const env = envGithubStore();
+  return env
+    ? { connected: true, savedAt: null, account: env.account, disabledAt: null, source: "env" }
+    : { connected: false, savedAt: null, account: null, disabledAt: null, source: null };
+}
+
+/** Validate a GitHub PAT live against /user, then vault it (Postgres, durable). */
+export async function connectGithub(
+  rawToken: string,
+): Promise<{ ok: boolean; error?: string; login?: string; persisted?: boolean }> {
+  const token = rawToken.trim();
+  if (token.length < 20 || /\s/.test(token)) {
+    return {
+      ok: false,
+      error:
+        "That doesn't look like a GitHub token — create a fine-grained or classic PAT at github.com/settings/tokens.",
+    };
+  }
+  try {
+    const res = await fetch(`${GITHUB_API}/user`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "fleet-control-agent",
+      },
+      signal: AbortSignal.timeout(15000),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      return {
+        ok: false,
+        error:
+          res.status === 401
+            ? "GitHub rejected the token (401) — it may be expired or a typo."
+            : `GitHub API returned ${res.status}.`,
+      };
+    }
+    const body = (await res.json()) as { login?: string; type?: string };
+    const scopes = res.headers.get("x-oauth-scopes");
+    const store: GithubAuthStore = {
+      token,
+      savedAt: new Date().toISOString(),
+      account: {
+        login: String(body.login ?? "unknown"),
+        type: String(body.type ?? "User"),
+        scopes: scopes && scopes.length > 0 ? scopes : null,
+      },
+    };
+    // reconnecting clears the disconnect marker — the vault is live again
+    await setDisableFlag("github", false);
+    // durable vault FIRST (Postgres row survives cold starts), file mirror is
+    // best-effort for local dev — this is the fix for the silent no-op that
+    // "add token" used to be on serverless
+    const persisted = await writeState(GITHUB_STATE_KEY, store);
+    await writeJson(GITHUB_AUTH_PATH, store);
+    return { ok: true, login: store.account.login, persisted };
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Could not reach GitHub: ${e instanceof Error ? e.message : "network error"}`,
+    };
+  }
+}
+
+export async function disconnectGithub(): Promise<void> {
+  // remove the durable vault row AND the local file mirror — then suppress
+  // the env fallback too; this is what makes disconnect REAL
+  await deleteState(GITHUB_STATE_KEY);
+  try {
+    await fs.rm(GITHUB_AUTH_PATH, { force: true });
+  } catch {
+    /* best-effort */
+  }
+  await setDisableFlag("github", true);
+}
+
+/**
+ * Default parent for approval-based access codes — the permanent env key on
+ * deployed instances, else the newest live minted link. Returns the parent
+ * HASH PREFIX only (sha256(key)[0:32]) — no plaintext ever leaves this module.
+ */
+export async function defaultAccessParent(): Promise<{
+  ph: string;
+  hint: string;
+  scopes: AgentScope[];
+} | null> {
+  const cands = await listParentCandidates();
+  const parent = cands.find((c) => c.label === "env agent link") ?? cands[0] ?? null;
+  if (!parent) return null;
+  return { ph: parent.keyHash.slice(0, 32), hint: parent.keyHint, scopes: parent.scopes };
+}
+
+// ─── sessions ────────────────────────────────────────────────────────────────
+
+function newId(): string {
+  return `s_${randomBytes(6).toString("hex")}`;
+}
+
+function newKey(): string {
+  return `flk_${randomBytes(24).toString("hex")}`;
+}
+
+/** sha256 hex of a capability key — the ONLY form persisted (H5). */
+function keyHashOf(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+/** True when the stored session record authenticates the presented key
+ * (hash match, or legacy plaintext match — timing-safe in both paths).
+ * Exported for selfops' promote flow (it matches a presented key against
+ * the store without the store ever holding plaintext). */
+export function sessionMatchesKey(s: AgentSession, key: string): boolean {
+  const presented = Buffer.from(keyHashOf(key), "hex");
+  if (s.keyHash) {
+    const stored = Buffer.from(s.keyHash, "hex");
+    return stored.length === presented.length && timingSafeEqual(stored, presented);
+  }
+  if (s.key) {
+    // legacy plaintext record
+    const legacy = createHash("sha256").update(s.key).digest();
+    return legacy.length === presented.length && timingSafeEqual(legacy, presented);
+  }
+  return false;
+}
+
+export async function readSessions(): Promise<AgentSession[]> {
+  // Postgres (durable) with file fallback — minted links survive cold starts now
+  const store = await readState<{ sessions: AgentSession[] }>("agent-sessions");
+  return store?.sessions ?? [];
+}
+
+/**
+ * Atomic session-list mutation under optimistic-CAS (H1, 2026-09-21).
+ * Concurrent proxy calls (touchSession bursts) and dashboard edits (create/
+ * revoke) can no longer drop each other's changes. The callback may run more
+ * than once on retry — keep it pure.
+ */
+async function mutateSessions(
+  fn: (sessions: AgentSession[]) => AgentSession[],
+): Promise<void> {
+  await mutateState<{ sessions: AgentSession[] }>("agent-sessions", (cur) => ({
+    sessions: fn(cur?.sessions ?? []).slice(-MAX_SESSIONS),
+  }));
+}
+
+export interface CreatedSession {
+  session: AgentSession;
+  key: string; // full capability — returned EXACTLY ONCE, never stored in the clear
+  url: string; // the link the user pastes into chat
+}
+
+export async function createSession(input: {
+  label: string;
+  scopes: AgentScope[];
+  ttlHours: number;
+}): Promise<CreatedSession> {
+  const ttl = Math.min(Math.max(Math.round(input.ttlHours), 1), 24 * 30);
+  const key = newKey();
+  const session: AgentSession = {
+    id: newId(),
+    keyHash: keyHashOf(key),
+    keyHint: hintOf(key),
+    label: input.label.trim().slice(0, 60) || "agent session",
+    scopes: input.scopes.filter((s) => ALL_SCOPES.includes(s)),
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + ttl * 3600_000).toISOString(),
+    lastUsedAt: null,
+    callCount: 0,
+    revoked: false,
+  };
+  await mutateSessions((sessions) => [...sessions, session]);
+  return {
+    session: { ...session },
+    key,
+    url: `/api/agent/proxy?session=${key}`,
+  };
+}
+
+export async function revokeSession(id: string): Promise<boolean> {
+  let found = false;
+  await mutateSessions((sessions) => {
+    if (!sessions.some((s) => s.id === id)) return sessions;
+    found = true;
+    return sessions.map((s) => (s.id === id ? { ...s, revoked: true } : s));
+  });
+  return found;
+}
+
+/**
+ * Split the FLEET_AGENT_KEYS value into entries. "|" separates entries
+ * (canonical — an entry's scope spec itself uses ","). Legacy comma-joined
+ * values are handled by re-attaching any fragment that does not start with
+ * "flk_" to the previous entry (scope fragments never start with flk_, keys
+ * always do). Comma-splitting the whole value used to truncate multi-scope
+ * entries to their first scope — caught during the v14.1 rotation.
+ */
+export function splitKeyEntries(raw: string): string[] {
+  const fragments = raw
+    .split(/[|,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const entries: string[] = [];
+  for (const frag of fragments) {
+    if (frag.startsWith("flk_") || entries.length === 0) {
+      entries.push(frag);
+    } else {
+      entries[entries.length - 1] += `,${frag}`;
+    }
+  }
+  return entries;
+}
+
+/**
+ * Parse one FLEET_AGENT_KEYS entry. Entries look like
+ *   flk_<hex>                          → scopes fall back to FLEET_AGENT_SCOPES
+ *   flk_<hex>:github:read,vercel:read  → fine-grained per-key scopes
+ * (keys themselves never contain ":", so the first colon is the separator —
+ * this is what makes permanent env keys narrow-scope instead of all-powerful,
+ * closing the "env keys are full-scope" gap flagged by the security review.)
+ */
+function parseKeyEntry(entry: string): { key: string; scopeSpec?: string } {
+  const idx = entry.indexOf(":");
+  if (idx === -1) return { key: entry };
+  return { key: entry.slice(0, idx), scopeSpec: entry.slice(idx + 1) };
+}
+
+function parseScopes(spec: string): AgentScope[] {
+  return spec
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s): s is AgentScope => (ALL_SCOPES as string[]).includes(s));
+}
+
+/**
+ * Serverless fallback for deployed instances: keys from FLEET_AGENT_KEYS
+ * (comma-separated, optionally `key:scope1,scope2` per entry) act as
+ * always-valid links. Bare keys get the scopes in FLEET_AGENT_SCOPES
+ * (default: all four).
+ */
+function envSession(key: string): AgentSession | null {
+  const entries = splitKeyEntries(process.env.FLEET_AGENT_KEYS ?? "");
+  const matched = entries
+    .map(parseKeyEntry)
+    .find((e) => e.key === key);
+  if (!matched) return null;
+  const scopes = matched.scopeSpec
+    ? parseScopes(matched.scopeSpec)
+    : parseScopes(
+        process.env.FLEET_AGENT_SCOPES ??
+          "github:read,github:write,vercel:read,vercel:write",
+      );
+  return {
+    id: "env_agent",
+    keyHash: keyHashOf(key),
+    keyHint: hintOf(key),
+    label: "env agent link",
+    scopes,
+    createdAt: new Date(0).toISOString(),
+    expiresAt: new Date(Date.now() + 3650 * 86400_000).toISOString(),
+    lastUsedAt: null,
+    callCount: 0,
+    revoked: false,
+  };
+}
+
+/** Resolve a capability key → live session (or null with a reason).
+ * v22: ONLY `fls_…` derived approval sessions resolve here. Direct agent
+ * links (`flk_…`, store or env) are retired — access is granted exclusively
+ * through the temp-password + approval flow (/api/agent/access). */
+export async function resolveSession(
+  key: string | null,
+): Promise<{ session: AgentSession } | { error: string }> {
+  if (!key || !key.startsWith("fls_")) {
+    return {
+      error:
+        "direct agent links are disabled — ask the owner for a temp password (fac_…) and use /api/agent/access (request → approval → poll)",
+    };
+  }
+  const p = verifyDerivedToken(key);
+  if (!p) return { error: "invalid or expired derived session — request access again" };
+  const parent = await findParentByHash(p.ph);
+  if (!parent) return { error: "parent link is gone — this derived session is dead" };
+  const scopes = p.sc.filter((s) => parent.scopes.includes(s));
+  if (scopes.length === 0) return { error: "derived session has no usable scopes" };
+  return {
+    session: {
+      id: `derived_${p.jti}`,
+      keyHash: keyHashOf(key),
+      keyHint: `fls_…${key.slice(-4)}`,
+      label: `derived session · ${parent.label}`,
+      scopes,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(p.exp).toISOString(),
+      lastUsedAt: null,
+      callCount: 0,
+      revoked: false,
+    },
+  };
+}
+
+/** Rewrite a pre-H5 plaintext session record as keyHash + keyHint (best-effort,
+ * non-fatal — the next successful use retries). RETAINED for reference since
+ * v22 retired the flk_ path that called it. */
+async function migrateLegacySession(id: string, plaintextKey: string): Promise<void> {
+  try {
+    await mutateSessions((sessions) =>
+      sessions.map((s) =>
+        s.id === id && s.key && !s.keyHash
+          ? { ...s, keyHash: keyHashOf(plaintextKey), keyHint: hintOf(plaintextKey), key: undefined }
+          : s,
+      ),
+    );
+  } catch {
+    /* best-effort */
+  }
+}
+void migrateLegacySession;
+
+export async function touchSession(id: string): Promise<void> {
+  const now = new Date().toISOString();
+  await mutateSessions((sessions) =>
+    sessions.map((x) =>
+      x.id === id ? { ...x, lastUsedAt: now, callCount: x.callCount + 1 } : x,
+    ),
+  );
+}
+
+// ─── derived sessions + pairing codes (stateless HMAC — cold-start-proof) ───
+//
+// The SESSION HANDOFF pattern (user's idea, third round of the security
+// review): the long-lived agent link becomes a BOOTSTRAP secret, not the
+// working credential. Two tiers:
+//
+//   1. EXCHANGE — present a valid link (or a pair code) → get a 1-hour
+//      derived session `fls_<payload>.<sig>`. All work happens under the
+//      short-lived token; the link can stay out of URLs and chat from then
+//      on.
+//   2. PAIRING — the dashboard (admin-gated) shows a ONE-TIME `pair_<…>`
+//      code bound to a parent link, valid 10 minutes. Paste ONLY the code
+//      in chat — the link itself never enters the transcript.
+//
+// Design notes (all deliberate):
+//   • Stateless: HMAC-signed {parentHash, scopes, exp} — any lambda instance
+//     can verify without shared storage, so derived sessions survive cold
+//     starts (the exact failure mode of FS-backed minted links).
+//   • The parent key is NEVER embedded — only sha256(parentKey)[0:32]. A
+//     leaked fls_ token does NOT leak the parent.
+//   • Every verification re-resolves the parent from the live store/env —
+//     revoking or rotating the parent kills ALL derived sessions instantly.
+//   • Scopes are intersected with the parent's at verify time — a derived
+//     token can never out-scope its parent.
+//   • Pair codes are one-time via a per-warm-instance consumed ledger
+//     (best-effort on serverless, same honesty as the challenge flow) and
+//     die in 10 minutes regardless.
+
+const DERIVED_TTL_MS = 60 * 60_000; // 1 hour of work per handshake
+const PAIR_TTL_MS = 10 * 60_000; // one-time code lives 10 minutes
+
+function b64url(input: string | Buffer): string {
+  return Buffer.from(input).toString("base64url");
+}
+
+/** Token signing secret — dedicated env if set, else the agent keys themselves
+ * (always present on the deployed instance), else the admin gate secret.
+ * H5 (2026-09-21): the old "open" literal fallback is GONE — with no secret
+ * configured (local dev without env) a random per-process secret is used
+ * instead: derived sessions won't survive restarts there, but they can never
+ * be forged by an attacker who knows no secret is configured. */
+let fallbackDerivedSecret: Buffer | null = null;
+
+function derivedSecret(): Buffer {
+  const basis =
+    process.env.FLEET_AGENT_SESSION_SECRET ||
+    process.env.FLEET_AGENT_KEYS ||
+    process.env.FLEET_ADMIN_PASSWORD;
+  if (basis) return createHash("sha256").update(`fleet-derived:${basis}`).digest();
+  if (!fallbackDerivedSecret) fallbackDerivedSecret = randomBytes(32);
+  return fallbackDerivedSecret;
+}
+
+/** Parents are referenced by sha256(key) prefix — never by plaintext. */
+function parentHash(parentKey: string): string {
+  return createHash("sha256").update(parentKey).digest("hex").slice(0, 32);
+}
+
+function hintOf(key: string): string {
+  return key.length > 12 ? `flk_…${key.slice(-4)}` : "flk_…";
+}
+
+interface ParentCandidate {
+  /** H5: parents are referenced by their key HASH — plaintext is no longer
+   * available for stored sessions (only env entries hash a live key here). */
+  keyHash: string; // full sha256 hex
+  keyHint: string; // masked form for display
+  scopes: AgentScope[];
+  label: string;
+}
+
+/** Hash of a stored session record (handles both H5 rows and legacy
+ * plaintext rows without ever returning the key). */
+function storedKeyHash(s: AgentSession): string | null {
+  if (s.keyHash) return s.keyHash;
+  if (s.key) return keyHashOf(s.key);
+  return null;
+}
+
+async function listParentCandidates(): Promise<ParentCandidate[]> {
+  const sessions = await readSessions();
+  const out: ParentCandidate[] = [];
+  for (const s of sessions) {
+    if (s.revoked || new Date(s.expiresAt).getTime() <= Date.now()) continue;
+    const kh = storedKeyHash(s);
+    if (!kh) continue;
+    out.push({
+      keyHash: kh,
+      keyHint: s.keyHint ?? hintOf(s.key ?? ""),
+      scopes: s.scopes,
+      label: s.label,
+    });
+  }
+  for (const entry of splitKeyEntries(process.env.FLEET_AGENT_KEYS ?? "")) {
+    const parsed = parseKeyEntry(entry);
+    const es = envSession(parsed.key);
+    if (es) {
+      out.push({
+        keyHash: es.keyHash,
+        keyHint: es.keyHint,
+        scopes: es.scopes,
+        label: es.label,
+      });
+    }
+  }
+  return out;
+}
+
+async function findParentByHash(ph: string): Promise<ParentCandidate | null> {
+  const wanted = Buffer.from(ph, "hex");
+  for (const c of await listParentCandidates()) {
+    // parentHash(key) === sha256(key)[0:32] → compare against keyHash prefix
+    const prefix = Buffer.from(c.keyHash.slice(0, 32), "hex");
+    if (prefix.length === wanted.length && timingSafeEqual(prefix, wanted)) return c;
+  }
+  return null;
+}
+
+async function findParentByKey(parentKey: string): Promise<ParentCandidate | null> {
+  const wanted = Buffer.from(keyHashOf(parentKey), "hex");
+  for (const c of await listParentCandidates()) {
+    const h = Buffer.from(c.keyHash, "hex");
+    if (h.length === wanted.length && timingSafeEqual(h, wanted)) return c;
+  }
+  return null;
+}
+
+function hmacSign(payload: string): string {
+  return createHmac("sha256", derivedSecret()).update(payload).digest("base64url");
+}
+
+function hmacCheck(payload: string, sig: string): boolean {
+  const a = createHash("sha256").update(sig).digest();
+  const b = createHash("sha256").update(hmacSign(payload)).digest();
+  return timingSafeEqual(a, b);
+}
+
+export interface DerivedToken {
+  token: string;
+  expiresAt: string;
+  scopes: AgentScope[];
+  parentHint: string;
+}
+
+/** Mint a 1-hour derived session bound to a parent link. */
+export async function mintDerivedSession(
+  parentKey: string,
+  requestedScopes?: string[],
+): Promise<DerivedToken | { error: string }> {
+  const parent = await findParentByKey(parentKey);
+  if (!parent) return { error: "unknown, expired or revoked parent link" };
+  const scopes = (
+    requestedScopes?.length
+      ? requestedScopes.filter(
+          (s): s is AgentScope =>
+            (ALL_SCOPES as string[]).includes(s) && parent.scopes.includes(s as AgentScope),
+        )
+      : parent.scopes
+  ).filter((s, i, a) => a.indexOf(s) === i);
+  if (scopes.length === 0) return { error: "no requested scope is granted by the parent link" };
+  // parentHash(parentKey) — the caller PRESENTED the key, so we can hash it
+  // directly even though the vault only stores hashes.
+  return mintDerivedForHash(parentHash(parentKey), scopes, hintOf(parentKey));
+}
+
+/** Mint a derived session from an already-computed parent hash (pair-code
+ * flow) — no plaintext key needed anywhere in this path. */
+async function mintDerivedForHash(
+  ph: string,
+  scopes: AgentScope[],
+  parentHint: string,
+): Promise<DerivedToken | { error: string }> {
+  if (scopes.length === 0) return { error: "no usable scopes" };
+  const exp = Date.now() + DERIVED_TTL_MS;
+  const payload = b64url(
+    JSON.stringify({
+      v: 1,
+      ph,
+      sc: scopes,
+      exp,
+      jti: randomBytes(8).toString("hex"),
+    }),
+  );
+  return {
+    token: `fls_${payload}.${hmacSign(payload)}`,
+    expiresAt: new Date(exp).toISOString(),
+    scopes,
+    parentHint,
+  };
+}
+
+interface DerivedPayload {
+  v: number;
+  ph: string;
+  sc: AgentScope[];
+  exp: number;
+  jti: string;
+}
+
+function verifyDerivedToken(token: string): DerivedPayload | null {
+  if (!token.startsWith("fls_")) return null;
+  const body = token.slice(4);
+  const dot = body.indexOf(".");
+  if (dot <= 0) return null;
+  const payload = body.slice(0, dot);
+  if (!hmacCheck(payload, body.slice(dot + 1))) return null;
+  try {
+    const p = JSON.parse(Buffer.from(payload, "base64url").toString()) as DerivedPayload;
+    if (p.v !== 1 || typeof p.exp !== "number" || p.exp < Date.now()) return null;
+    if (typeof p.ph !== "string" || !Array.isArray(p.sc) || typeof p.jti !== "string") return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+export interface PairCode {
+  code: string;
+  expiresAt: string;
+  parentHint: string;
+}
+
+/** Mint a one-time pairing code. Default parent: the permanent env key (the
+ * workhorse on deployed instances), else the newest live minted link. */
+export async function mintPairCode(parentKey?: string): Promise<PairCode | { error: string }> {
+  let parent: ParentCandidate | null = null;
+  if (parentKey) {
+    parent = await findParentByKey(parentKey);
+    if (!parent) return { error: "unknown, expired or revoked parent link" };
+  } else {
+    const cands = await listParentCandidates();
+    parent = cands.find((c) => c.label === "env agent link") ?? cands[0] ?? null;
+    if (!parent) return { error: "no live agent link or env key to pair against" };
+  }
+  const exp = Date.now() + PAIR_TTL_MS;
+  const ph = parent.keyHash.slice(0, 32); // sha256(key)[0:32] === parentHash(key)
+  const payload = b64url(
+    JSON.stringify({ v: 1, ph, exp, jti: randomBytes(6).toString("hex") }),
+  );
+  return {
+    code: `pair_${payload}.${hmacSign(payload)}`,
+    expiresAt: new Date(exp).toISOString(),
+    parentHint: parent.keyHint,
+  };
+}
+
+const consumedPairJtis = new Set<string>(); // one-time ledger (per warm instance)
+
+/** Verify a pairing code → parent hash (or reason). Single-use, 10 min TTL. */
+export async function verifyPairCode(code: string): Promise<{ ph: string } | { error: string }> {
+  if (!code.startsWith("pair_")) return { error: "malformed pairing code" };
+  const body = code.slice(5);
+  const dot = body.indexOf(".");
+  if (dot <= 0) return { error: "malformed pairing code" };
+  const payload = body.slice(0, dot);
+  if (!hmacCheck(payload, body.slice(dot + 1))) return { error: "invalid pairing code" };
+  try {
+    const p = JSON.parse(Buffer.from(payload, "base64url").toString()) as {
+      v: number;
+      ph: string;
+      exp: number;
+      jti: string;
+    };
+    if (p.v !== 1 || typeof p.exp !== "number" || p.exp < Date.now()) {
+      return { error: "pairing code expired — generate a new one in the dashboard" };
+    }
+    if (consumedPairJtis.has(p.jti)) {
+      return { error: "pairing code already used — it is one-time" };
+    }
+    consumedPairJtis.add(p.jti);
+    return { ph: p.ph };
+  } catch {
+    return { error: "invalid pairing code" };
+  }
+}
+
+/** Exchange a verified pair-code parent hash → 1h derived session. */
+export async function mintDerivedFromPairHash(
+  ph: string,
+  requestedScopes?: string[],
+): Promise<DerivedToken | { error: string }> {
+  const parent = await findParentByHash(ph);
+  if (!parent) return { error: "the paired link is gone or expired" };
+  const scopes = (
+    requestedScopes?.length
+      ? requestedScopes.filter(
+          (s): s is AgentScope =>
+            (ALL_SCOPES as string[]).includes(s) && parent.scopes.includes(s as AgentScope),
+        )
+      : parent.scopes
+  ).filter((s, i, a) => a.indexOf(s) === i);
+  return mintDerivedForHash(ph, scopes, parent.keyHint);
+}
+
+// ─── activity audit log ──────────────────────────────────────────────────────
+
+export async function readActivity(): Promise<AgentActivityEntry[]> {
+  return (await readState<AgentActivityEntry[]>("agent-activity")) ?? [];
+}
+
+export async function logActivity(entry: AgentActivityEntry): Promise<void> {
+  // Atomic prepend under optimistic-CAS — burst proxy calls can no longer drop
+  // each other's audit entries (H1, 2026-09-21).
+  await mutateState<AgentActivityEntry[]>("agent-activity", (cur) =>
+    [entry, ...(cur ?? [])].slice(0, MAX_ACTIVITY),
+  );
+}
+
+// ─── outbound helpers used by the proxy route ────────────────────────────────
+
+export interface ProxyResult {
+  status: number;
+  data: unknown;
+  errorText?: string;
+}
+
+export async function githubFetch(
+  path: string,
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+  body: unknown,
+): Promise<ProxyResult> {
+  const store = await readGithubAuth();
+  if (!store) return { status: 0, data: null, errorText: "GitHub not connected in the vault" };
+  try {
+    const res = await fetch(`${GITHUB_API}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${store.token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "fleet-control-agent",
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(30000),
+      cache: "no-store",
+    });
+    const text = await res.text();
+    let data: unknown = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text.slice(0, 400);
+    }
+    return { status: res.status, data, errorText: text.slice(0, 240) };
+  } catch (e) {
+    return { status: 0, data: null, errorText: e instanceof Error ? e.message : "network error" };
+  }
+}
+
+export async function vercelFetch(
+  path: string,
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+  body: unknown,
+): Promise<ProxyResult> {
+  // reuse the vercel-ops token store
+  const { readVercelTokenForAgent } = await import("./vercel-ops");
+  const token = await readVercelTokenForAgent();
+  if (!token) return { status: 0, data: null, errorText: "Vercel not connected in the vault" };
+  try {
+    const res = await fetch(`https://api.vercel.com${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(30000),
+      cache: "no-store",
+    });
+    const text = await res.text();
+    let data: unknown = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text.slice(0, 400);
+    }
+    return { status: res.status, data, errorText: text.slice(0, 240) };
+  } catch (e) {
+    return { status: 0, data: null, errorText: e instanceof Error ? e.message : "network error" };
+  }
+}
